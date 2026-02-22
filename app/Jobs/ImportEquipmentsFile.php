@@ -34,15 +34,57 @@ class ImportEquipmentsFile implements ShouldQueue, ShouldBeUnique
 
     public function handle(): void
     {
-        if (!is_file($this->absolutePath)) {
-            throw new RuntimeException("File not found: {$this->absolutePath}");
+        $lines = $this->readLinesOrFail($this->absolutePath);
+        $headers = self::extractHeaders($lines);
+
+        if ($headers === []) {
+            throw new RuntimeException('Unable to parse header columns from equipments file.');
         }
 
-        $lines = file($this->absolutePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        $parsedRows = self::parseRows($lines, $headers);
+
+        if ($parsedRows === []) {
+            Log::warning('Equipments import produced no parsed rows.', [
+                'file' => $this->filename,
+            ]);
+            return;
+        }
+
+        $rowsForUpsert = self::buildRowsForUpsert($parsedRows);
+
+        if ($rowsForUpsert === []) {
+            Log::warning('Equipments import has no rows to store.', [
+                'file' => $this->filename,
+            ]);
+            return;
+        }
+
+        $this->upsertRows($rowsForUpsert);
+
+        Cache::put('equipments:last_imported_file', $this->filename);
+
+        Log::info('Equipments import done.', [
+            'file' => $this->filename,
+            'rows' => count($rowsForUpsert),
+        ]);
+    }
+
+    private function readLinesOrFail(string $absolutePath): array
+    {
+        if (!is_file($absolutePath)) {
+            throw new RuntimeException("File not found: {$absolutePath}");
+        }
+
+        $lines = file($absolutePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
         if ($lines === false || $lines === []) {
-            throw new RuntimeException("Unable to read file: {$this->absolutePath}");
+            throw new RuntimeException("Unable to read file: {$absolutePath}");
         }
 
+        return $lines;
+    }
+
+    public static function extractHeaders(array &$lines): array
+    {
         $headers = [];
 
         for ($headerLineIndex = 0; $headerLineIndex < count($lines); $headerLineIndex += 3) {
@@ -89,10 +131,11 @@ class ImportEquipmentsFile implements ShouldQueue, ShouldBeUnique
             }
         }
 
-        if ($headers === []) {
-            throw new RuntimeException('Unable to parse header columns from equipments file.');
-        }
+        return $headers;
+    }
 
+    public static function parseRows(array $lines, array $headers): array
+    {
         $parsedRows = [];
 
         for ($contentLine = 5; $contentLine < count($lines); $contentLine += 3) {
@@ -127,117 +170,34 @@ class ImportEquipmentsFile implements ShouldQueue, ShouldBeUnique
             }
         }
 
-        // sql query to store data in equipments table
-        if ($parsedRows === []) {
-            Log::warning('Equipments import produced no parsed rows.', [
-                'file' => $this->filename,
-            ]);
-            return;
-        }
+        return $parsedRows;
+    }
 
-        $get = static function (array $row, string $name): ?string {
-            foreach ($row as $key => $value) {
-                $key = (string) $key;
-                if ($key === $name || str_starts_with($key, $name . '#')) {
-                    $clean = trim((string) $value);
-                    if ($clean !== '') {
-                        return $clean;
-                    }
-                }
-            }
-
-            return null;
-        };
-
-        $getAll = static function (array $row, string $name): array {
-            $values = [];
-            foreach ($row as $key => $value) {
-                $key = (string) $key;
-                if ($key === $name || str_starts_with($key, $name . '#')) {
-                    $clean = trim((string) $value);
-                    if ($clean !== '') {
-                        $values[] = $clean;
-                    }
-                }
-            }
-
-            return $values;
-        };
-
-        $toDate = static function (?string $raw): ?string {
-            $raw = trim((string) $raw);
-            if ($raw === '' || $raw === '00.00.0000') {
-                return null;
-            }
-
-            $date = \DateTimeImmutable::createFromFormat('d.m.Y', $raw);
-            if ($date === false) {
-                return null;
-            }
-
-            return $date->format('Y-m-d');
-        };
-
-        $toTimestamp = static function (?string $raw): ?string {
-            $raw = trim((string) $raw);
-            if ($raw === '' || $raw === '00.00.0000') {
-                return null;
-            }
-
-            $date = \DateTimeImmutable::createFromFormat('d.m.Y', $raw);
-            if ($date === false) {
-                return null;
-            }
-
-            return $date->format('Y-m-d 00:00:00');
-        };
-
-        $toFloat = static function (?string $raw): ?float {
-            $raw = trim((string) $raw);
-            if ($raw === '') {
-                return null;
-            }
-
-            if (str_contains($raw, ',')) {
-                $raw = str_replace('.', '', $raw);
-                $raw = str_replace(',', '.', $raw);
-            }
-
-            return is_numeric($raw) ? (float) $raw : null;
-        };
-
-        $toInt = static function (?string $raw): int {
-            $raw = trim((string) $raw);
-            if ($raw === '' || preg_match('/^-?\d+$/', $raw) !== 1) {
-                return 0;
-            }
-
-            return (int) $raw;
-        };
-
+    public static function buildRowsForUpsert(array $parsedRows): array
+    {
         $rowsForUpsert = [];
 
         foreach ($parsedRows as $row) {
-            $equipment = $get($row, 'Equipment');
+            $equipment = self::getFirstValue($row, 'Equipment');
             if ($equipment === null) {
                 continue;
             }
 
-            $material = $get($row, 'Material');
-            $oldMaterial = $get($row, 'Old material no.');
+            $material = self::getFirstValue($row, 'Material');
+            $oldMaterial = self::getFirstValue($row, 'Old material no.');
             $materialWithoutFet = $oldMaterial ?: (preg_replace('/-FET$/', '', (string) $material) ?: $equipment);
 
-            $stats = $getAll($row, 'Stat');
+            $stats = self::getAllValues($row, 'Stat');
             $userStatus = $stats[0] ?? '';
             $systemStatus = $stats[1] ?? ($stats[0] ?? '');
 
-            $shortDescription = $get($row, 'Short description');
-            $shortDesc = $get($row, 'Short desc.');
+            $shortDescription = self::getFirstValue($row, 'Short description');
+            $shortDesc = self::getFirstValue($row, 'Short desc.');
 
-            $createdBy = $get($row, 'Created By') ?? '';
-            $changedBy = $get($row, 'Changed by') ?? '';
-            $workcenter = $get($row, 'WkCtr') ?? $get($row, 'Work ctr') ?? $get($row, 'WorkCtr') ?? '';
-            $materialStatus = $get($row, 'MS') ?? '';
+            $createdBy = self::getFirstValue($row, 'Created By') ?? '';
+            $changedBy = self::getFirstValue($row, 'Changed by') ?? '';
+            $workcenter = self::getFirstValue($row, 'WkCtr') ?? self::getFirstValue($row, 'Work ctr') ?? self::getFirstValue($row, 'WorkCtr') ?? '';
+            $materialStatus = self::getFirstValue($row, 'MS') ?? '';
 
             $currentStatus = trim($userStatus . ' ' . $systemStatus);
             if ($currentStatus === '') {
@@ -248,18 +208,18 @@ class ImportEquipmentsFile implements ShouldQueue, ShouldBeUnique
                 'Equipment' => $equipment,
                 'Material' => $material,
                 'MaterialWithoutFet' => $materialWithoutFet,
-                'Description' => $get($row, 'Material Description'),
-                'IH09Description' => $get($row, 'Description of Technical Object'),
-                'Room' => $get($row, 'Room'),
-                'Plant' => $get($row, 'Plnt'),
-                'Location' => $get($row, 'Location'),
-                'Sloc' => $get($row, 'SLoc'),
-                'SuperEq' => $get($row, 'Superord.Equipment'),
-                'ManufactSerialNumber' => $get($row, 'ManufactSerialNumber') ?? $get($row, 'Serial Number') ?? $equipment,
-                'SerNo' => $get($row, 'Serial Number'),
+                'Description' => self::getFirstValue($row, 'Material Description'),
+                'IH09Description' => self::getFirstValue($row, 'Description of Technical Object'),
+                'Room' => self::getFirstValue($row, 'Room'),
+                'Plant' => self::getFirstValue($row, 'Plnt'),
+                'Location' => self::getFirstValue($row, 'Location'),
+                'Sloc' => self::getFirstValue($row, 'SLoc'),
+                'SuperEq' => self::getFirstValue($row, 'Superord.Equipment'),
+                'ManufactSerialNumber' => self::getFirstValue($row, 'ManufactSerialNumber') ?? self::getFirstValue($row, 'Serial Number') ?? $equipment,
+                'SerNo' => self::getFirstValue($row, 'Serial Number'),
                 'UserStatus' => $userStatus,
                 'SystemStatus' => $systemStatus,
-                'Dimensions' => $get($row, 'Size/dimensions'),
+                'Dimensions' => self::getFirstValue($row, 'Size/dimensions'),
                 'CleaningCounter_limit' => 0,
                 'CleaningCounter_current' => 0,
                 'ToolCompetence' => (string) ($shortDescription ?? $shortDesc ?? ''),
@@ -267,36 +227,120 @@ class ImportEquipmentsFile implements ShouldQueue, ShouldBeUnique
                 'NextCalDate' => null,
                 'NextCtrlDate' => null,
                 'NEN3140Int' => 0,
-                'MaintInt' => $toInt($get($row, 'PP')),
+                'MaintInt' => self::toInt(self::getFirstValue($row, 'PP')),
                 'NextNEN3140Date' => null,
                 'CalInt' => 0,
                 'NextMaintDate' => null,
                 'CertInt' => 0,
                 'CtrlInt' => 0,
-                'ExempEndDate' => $toDate($get($row, 'to')),
-                'Min_CALD_Date' => $toDate($get($row, 'Valid From')),
-                'GrossWeight' => $toFloat($get($row, 'Gross Weight')),
+                'ExempEndDate' => self::toDate(self::getFirstValue($row, 'to')),
+                'Min_CALD_Date' => self::toDate(self::getFirstValue($row, 'Valid From')),
+                'GrossWeight' => self::toFloat(self::getFirstValue($row, 'Gross Weight')),
                 'current_status' => $currentStatus,
                 'needed_time' => null,
                 'return_time' => null,
                 'workcenter' => $workcenter,
                 'material_status' => $materialStatus,
-                'StockType' => $get($row, 'S'),
+                'StockType' => self::getFirstValue($row, 'S'),
                 'SpecialStock' => null,
-                'CreatedOn' => $toTimestamp($get($row, 'Created On')),
+                'CreatedOn' => self::toTimestamp(self::getFirstValue($row, 'Created On')),
                 'CreatedBy' => $createdBy,
-                'ChangedOn' => $toTimestamp($get($row, 'Chngd On')),
+                'ChangedOn' => self::toTimestamp(self::getFirstValue($row, 'Chngd On')),
                 'ChangedBy' => $changedBy,
             ];
         }
 
-        if ($rowsForUpsert === []) {
-            Log::warning('Equipments import has no rows to store.', [
-                'file' => $this->filename,
-            ]);
-            return;
+        return $rowsForUpsert;
+    }
+
+    public static function getFirstValue(array $row, string $name): ?string
+    {
+        foreach ($row as $key => $value) {
+            $key = (string) $key;
+            if ($key === $name || str_starts_with($key, $name . '#')) {
+                $clean = trim((string) $value);
+                if ($clean !== '') {
+                    return $clean;
+                }
+            }
         }
 
+        return null;
+    }
+
+    public static function getAllValues(array $row, string $name): array
+    {
+        $values = [];
+        foreach ($row as $key => $value) {
+            $key = (string) $key;
+            if ($key === $name || str_starts_with($key, $name . '#')) {
+                $clean = trim((string) $value);
+                if ($clean !== '') {
+                    $values[] = $clean;
+                }
+            }
+        }
+
+        return $values;
+    }
+
+    public static function toDate(?string $raw): ?string
+    {
+        $raw = trim((string) $raw);
+        if ($raw === '' || $raw === '00.00.0000') {
+            return null;
+        }
+
+        $date = \DateTimeImmutable::createFromFormat('d.m.Y', $raw);
+        if ($date === false) {
+            return null;
+        }
+
+        return $date->format('Y-m-d');
+    }
+
+    public static function toTimestamp(?string $raw): ?string
+    {
+        $raw = trim((string) $raw);
+        if ($raw === '' || $raw === '00.00.0000') {
+            return null;
+        }
+
+        $date = \DateTimeImmutable::createFromFormat('d.m.Y', $raw);
+        if ($date === false) {
+            return null;
+        }
+
+        return $date->format('Y-m-d 00:00:00');
+    }
+
+    public static function toFloat(?string $raw): ?float
+    {
+        $raw = trim((string) $raw);
+        if ($raw === '') {
+            return null;
+        }
+
+        if (str_contains($raw, ',')) {
+            $raw = str_replace('.', '', $raw);
+            $raw = str_replace(',', '.', $raw);
+        }
+
+        return is_numeric($raw) ? (float) $raw : null;
+    }
+
+    public static function toInt(?string $raw): int
+    {
+        $raw = trim((string) $raw);
+        if ($raw === '' || preg_match('/^-?\d+$/', $raw) !== 1) {
+            return 0;
+        }
+
+        return (int) $raw;
+    }
+
+    private function upsertRows(array $rowsForUpsert): void
+    {
         $updateColumns = array_values(array_filter(
             array_keys($rowsForUpsert[0]),
             static fn(string $column): bool => $column !== 'Equipment'
@@ -307,12 +351,5 @@ class ImportEquipmentsFile implements ShouldQueue, ShouldBeUnique
                 DB::table('equipments')->upsert($chunk, ['Equipment'], $updateColumns);
             }
         });
-
-        Cache::put('equipments:last_imported_file', $this->filename);
-
-        Log::info('Equipments import done.', [
-            'file' => $this->filename,
-            'rows' => count($rowsForUpsert),
-        ]);
     }
 }
